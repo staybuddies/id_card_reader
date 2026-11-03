@@ -1,42 +1,36 @@
-# app.py
+"""Student-card OCR API. Run with uvicorn app:app --host 127.0.0.1."""
 from __future__ import annotations
-import base64
-import time
-from typing import Optional, Tuple, Dict, Any, List, Union
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import uvicorn
-from PIL import Image
+import base64
+import binascii
 import io
 import logging
+import os
 import re
+import warnings
+from typing import Optional
 
-# Import your OCR analyze function (expects image path/bytes/PIL.Image and returns dict with 'ok' and 'score')
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from PIL import Image, UnidentifiedImageError
+import uvicorn
+
 from ocr import analyze
 
-# -------------------------
-# App & logging
-# -------------------------
-app = FastAPI(title="Student Card OCR", version="1.0.0")
+logger = logging.getLogger(__name__)
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_IMAGE_PIXELS = 12_000_000
+MAX_BASE64_CHARS = ((MAX_IMAGE_BYTES + 2) // 3) * 4 + 128
 
-# CORS for local dev (tighten in prod)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-logger = logging.getLogger("uvicorn.error")
-logging.basicConfig(level=logging.INFO)
+app = FastAPI(title="Student Card OCR", version="1.1.0")
+origins = [origin.strip() for origin in os.getenv("OCR_ALLOWED_ORIGINS", "").split(",") if origin.strip()]
+if origins:
+    app.add_middleware(CORSMiddleware, allow_origins=origins,
+                       allow_credentials=False, allow_methods=["GET", "POST"],
+                       allow_headers=["Content-Type"])
 
 
-# -------------------------
-# Response / Request models
-# -------------------------
 class AnalyzeResponse(BaseModel):
     ok: bool
     score: float
@@ -49,281 +43,112 @@ class AnalyzeResponse(BaseModel):
 
 
 class AnalyzeBase64Request(BaseModel):
-    front_b64: str
-    back_b64: Optional[str] = None
-    selfie_b64: Optional[str] = None
+    front_b64: str = Field(min_length=1, max_length=MAX_BASE64_CHARS)
+    back_b64: Optional[str] = Field(default=None, max_length=MAX_BASE64_CHARS)
+    selfie_b64: Optional[str] = Field(default=None, max_length=MAX_BASE64_CHARS)
 
 
-# -------------------------
-# Helpers
-# -------------------------
-async def await_read_or_none(upload: Optional[UploadFile]) -> Optional[bytes]:
-    """Safely await UploadFile.read() or return None if upload is None."""
+def validate_image(data: bytes) -> bytes:
+    if not data:
+        raise HTTPException(400, "Image must not be empty")
+    if len(data) > MAX_IMAGE_BYTES:
+        raise HTTPException(413, "Image exceeds the 8 MiB limit")
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(data)) as image:
+                if image.format not in {"JPEG", "PNG", "WEBP"}:
+                    raise HTTPException(415, "Use a JPEG, PNG, or WebP image")
+                if image.width * image.height > MAX_IMAGE_PIXELS:
+                    raise HTTPException(413, "Image exceeds the 12 megapixel limit")
+                image.verify()
+    except (Image.DecompressionBombWarning, Image.DecompressionBombError):
+        raise HTTPException(413, "Image dimensions are too large") from None
+    except (UnidentifiedImageError, OSError, SyntaxError, ValueError):
+        raise HTTPException(400, "Invalid or corrupted image") from None
+    return data
+
+
+def read_upload(upload: Optional[UploadFile]) -> Optional[bytes]:
     if upload is None:
         return None
-    # UploadFile.read() is async
-    return await upload.read()
+    # Read a bounded amount even when the Content-Length header is absent.
+    return validate_image(upload.file.read(MAX_IMAGE_BYTES + 1))
 
 
-def _to_bytes_from_b64(b64: Optional[str]) -> Optional[bytes]:
-    if not b64:
+def decode_image(value: Optional[str]) -> Optional[bytes]:
+    if value is None:
         return None
-    # Allow data URI style: "data:...;base64,...."
+    payload = value
+    if value.startswith("data:"):
+        header, separator, payload = value.partition(",")
+        if not separator or not header.endswith(";base64"):
+            raise HTTPException(400, "Invalid base64 image")
+    if len(payload) > MAX_BASE64_CHARS:
+        raise HTTPException(413, "Image exceeds the 8 MiB limit")
     try:
-        payload = b64.split(",", 1)[-1]
-        return base64.b64decode(payload)
+        return validate_image(base64.b64decode(payload, validate=True))
+    except (binascii.Error, ValueError):
+        raise HTTPException(400, "Invalid base64 image") from None
+
+
+def analyze_images(front: bytes, back: Optional[bytes], **options) -> dict:
+    try:
+        front_result = analyze(front, **options)
+        results = [front_result]
+        if back:
+            results.append(analyze(back, **options))
+        # Keep the fields, confidence and success flag from the SAME result.
+        # A selfie is never evidence of a student ID or a face match.
+        result = next((item for item in results if item.get("ok") and item.get("student_id")), None)
+        if result is None:
+            result = max(results, key=lambda item: item.get("score", 0))
+        return {key: result.get(key) for key in AnalyzeResponse.model_fields}
+    except HTTPException:
+        raise
     except Exception:
-        raise ValueError("Invalid base64 image")
+        logger.exception("OCR inference failed")
+        raise HTTPException(500, "OCR processing failed") from None
 
 
-def _run_ocr_on_all(front_bytes: Optional[bytes],
-                    back_bytes: Optional[bytes],
-                    selfie_bytes: Optional[bytes]) -> Dict[str, Any]:
-    """
-    Run analyze() on available images and return merged result:
-    - prefer front result for student_id, but pick the highest score among all image results.
-    - return debug results for each image.
-    """
-    results = {}
-    debug: Dict[str, Any] = {}
-
-    def safe_call(img_bytes: Optional[bytes], label: str):
-        if not img_bytes:
-            return None
-        try:
-            res = analyze(img_bytes)
-            debug[label] = res
-            return res
-        except Exception as e:
-            logger.exception("OCR analyze failed for %s", label)
-            debug[label] = {"error": str(e)}
-            return None
-
-    front_res = safe_call(front_bytes, "front")
-    back_res = safe_call(back_bytes, "back")
-    selfie_res = safe_call(selfie_bytes, "selfie")
-
-    # Collect available results
-    candidates = []
-    for r, label in ((front_res, "front"), (back_res, "back"), (selfie_res, "selfie")):
-        if not r:
-            continue
-        candidates.append({"label": label, "result": r, "score": float(r.get("score", 0.0))})
-
-    # Pick best result by score (if any)
-    if candidates:
-        best_entry = max(candidates, key=lambda x: x["score"])
-        best_res = best_entry["result"]
-    else:
-        best_res = None
-
-    results["debug"] = debug
-    results["best_overall"] = best_res
-    return results
-
-
-# Best-effort extractor helpers to produce student_id, name, university, grad_year
-def _extract_fields_from_debug(debug: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Heuristics:
-     - student_id: choose best 'best_text' (alnum) or highest-confidence all_candidates token that looks like an ID
-     - name: look for token sequences with letters and spaces / capitalized words
-     - university: look for tokens containing 'univ' / 'university' / 'college' (case-insensitive)
-     - grad_year: 4-digit year between 1950 and 2100
-    """
-    student_id = None
-    name = None
-    university = None
-    grad_year = None
-
-    # Gather tokens from all candidate lists
-    tokens: List[Dict[str, Any]] = []
-    for label, val in debug.items():
-        if not isinstance(val, dict):
-            continue
-        ac = val.get("all_candidates")
-        if isinstance(ac, list):
-            for c in ac:
-                tokens.append({**c, "source": label})
-        bt = val.get("best_text")
-        if bt:
-            tokens.append({"text": bt, "conf": float(val.get("confidence", val.get("score", 0.0))), "source": label})
-
-    # Normalize token text and sort by confidence
-    for t in tokens:
-        t["text_norm"] = (t.get("text") or "").strip()
-
-    tokens = [t for t in tokens if t.get("text_norm")]
-    tokens.sort(key=lambda x: float(x.get("conf", 0.0)), reverse=True)
-
-    # Student ID heuristic: alphanumeric tokens (with optional hyphen) length 4..20
-    id_re = re.compile(r"^[A-Z0-9\-]{4,20}$", flags=re.IGNORECASE)
-    for t in tokens:
-        txt = t["text_norm"]
-        if id_re.match(txt):
-            student_id = txt
-            break
-
-    # University heuristic: token containing 'univ' or 'college' or 'faculty'
-    uni_keywords = re.compile(r"(univ|college|faculty|institute)", flags=re.IGNORECASE)
-    for t in tokens:
-        if uni_keywords.search(t["text_norm"]):
-            university = t["text_norm"]
-            break
-
-    # Name heuristic: multi-word or capitalized patterns
-    name_candidate = None
-    for t in tokens:
-        txt = t["text_norm"]
-        if sum(1 for ch in txt if ch.isalpha()) < 2:
-            continue
-        if " " in txt and len(txt) > 4:
-            name_candidate = txt
-            break
-        if re.search(r"[A-Z][a-z]+", txt):
-            name_candidate = txt
-            break
-    if name_candidate:
-        name = name_candidate
-
-    # grad_year heuristic: find 4-digit number between 1950..2100
-    year_re = re.compile(r"\b(19[5-9]\d|20[0-9]{2}|2100)\b")
-    for t in tokens:
-        m = year_re.search(t["text_norm"])
-        if m:
-            try:
-                year = int(m.group(0))
-                grad_year = year
-                break
-            except Exception:
-                pass
-
-    return {"student_id": student_id, "name": name, "university": university, "grad_year": grad_year}
-
-
-# -------------------------
-# Routes
-# -------------------------
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "status": "ok"}
 
 
+# Sync handlers run CPU/subprocess OCR work in FastAPI's worker pool.
 @app.post("/analyze", response_model=AnalyzeResponse)
-async def analyze_multipart(
-    request: Request,
-    front: UploadFile = File(..., description="Front side image file"),
-    back: UploadFile = File(None),
-    selfie: UploadFile = File(None),
+def analyze_multipart(
+    front: UploadFile = File(...),
+    back: Optional[UploadFile] = File(None),
+    selfie: Optional[UploadFile] = File(None),
+    id_regex: Optional[str] = Form(None, max_length=128),
+    conf_threshold: float = Form(50.0, ge=0, le=100),
+    score_threshold: Optional[float] = Form(None, ge=0, le=100),
+    try_rotations: bool = Form(True),
+    try_mirror: bool = Form(False),
+    prefer_cv2: bool = Form(True),
 ):
-    """
-    Upload files as multipart/form-data.
-    curl -F front=@IMG_1160.jpeg http://localhost:8000/analyze
-    """
-    t0 = time.time()
-    front_bytes = None
-    back_bytes = None
-    selfie_bytes = None
-    try:
-        # Safely await only when UploadFile exists
-        front_bytes = await await_read_or_none(front)
-        back_bytes = await await_read_or_none(back)
-        selfie_bytes = await await_read_or_none(selfie)
-
-        merged = _run_ocr_on_all(front_bytes, back_bytes, selfie_bytes)
-        debug = merged.get("debug", {})
-
-        best_overall = merged.get("best_overall")
-        if isinstance(best_overall, dict) and best_overall.get("score") is not None:
-            ok = bool(best_overall.get("ok", False))
-            score = float(best_overall.get("score", 0.0))
-        else:
-            front_dbg = debug.get("front") if debug else None
-            if front_dbg and isinstance(front_dbg, dict):
-                score = float(front_dbg.get("score", 0.0))
-                ok = bool(front_dbg.get("ok", False))
-            else:
-                ok = False
-                score = 0.0
-
-        fields = _extract_fields_from_debug(debug)
-
-        resp = {
-            "ok": bool(ok),
-            "score": float(score),
-            "student_id": fields.get("student_id"),
-            "name": fields.get("name"),
-            "university": fields.get("university"),
-            "grad_year": fields.get("grad_year"),
-            "note": None,
-            "debug": debug,
-        }
-        return resp
-    except Exception as e:
-        logger.exception("analyze endpoint failed")
-        # Return 400 so client knows this was a request-level problem
-        raise HTTPException(status_code=400, detail=str(e))
-    finally:
-        dt = (time.time() - t0) * 1000
+    if id_regex:
         try:
-            print(f"[ML] /analyze done in {dt:.0f} ms; front={len(front_bytes) if front_bytes else 0} bytes")
-        except Exception:
-            pass
+            re.compile(id_regex)
+        except re.error:
+            raise HTTPException(400, "Invalid student ID pattern") from None
+    front_bytes = read_upload(front)
+    back_bytes = read_upload(back)
+    read_upload(selfie)  # Accepted for compatibility; face verification is not implemented.
+    return analyze_images(front_bytes, back_bytes, id_regex=id_regex,
+                          conf_threshold=score_threshold if score_threshold is not None else conf_threshold,
+                          try_rotations=try_rotations, try_mirror=try_mirror, prefer_cv2=prefer_cv2)
 
 
 @app.post("/analyze_b64", response_model=AnalyzeResponse)
-def analyze_base64(req: AnalyzeBase64Request):
-    """Alternative: send base64 images in JSON."""
-    t0 = time.time()
-    try:
-        front_bytes = _to_bytes_from_b64(req.front_b64)
-        back_bytes = _to_bytes_from_b64(req.back_b64) if req.back_b64 else None
-        selfie_bytes = _to_bytes_from_b64(req.selfie_b64) if req.selfie_b64 else None
-
-        merged = _run_ocr_on_all(front_bytes, back_bytes, selfie_bytes)
-        debug = merged.get("debug", {})
-
-        best_overall = merged.get("best_overall")
-        if isinstance(best_overall, dict) and best_overall.get("score") is not None:
-            ok = bool(best_overall.get("ok", False))
-            score = float(best_overall.get("score", 0.0))
-        else:
-            front_dbg = debug.get("front") if debug else None
-            if front_dbg and isinstance(front_dbg, dict):
-                score = float(front_dbg.get("score", 0.0))
-                ok = bool(front_dbg.get("ok", False))
-            else:
-                ok = False
-                score = 0.0
-
-        fields = _extract_fields_from_debug(debug)
-        resp = {
-            "ok": bool(ok),
-            "score": float(score),
-            "student_id": fields.get("student_id"),
-            "name": fields.get("name"),
-            "university": fields.get("university"),
-            "grad_year": fields.get("grad_year"),
-            "note": None,
-            "debug": debug,
-        }
-        return resp
-    except ValueError as e:
-        logger.exception("Invalid input")
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.exception("analyze_b64 failed")
-        raise HTTPException(status_code=400, detail=str(e))
-    finally:
-        dt = (time.time() - t0) * 1000
-        try:
-            print(f"[ML] /analyze_b64 done in {dt:.0f} ms")
-        except Exception:
-            pass
+def analyze_base64(request: AnalyzeBase64Request):
+    front = decode_image(request.front_b64)
+    back = decode_image(request.back_b64)
+    decode_image(request.selfie_b64)
+    return analyze_images(front, back, conf_threshold=50.0)
 
 
-# -------------------------
-# CLI dev runner
-# -------------------------
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("app:app", host="127.0.0.1", port=8000)

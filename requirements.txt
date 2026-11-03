@@ -1,5 +1,5 @@
-fastapi==0.112.*
-uvicorn[standard]==0.30.*
+fastapi==0.162.0
+uvicorn[standard]==0.54.0
 pillow
 pytesseract
 opencv-python-headless==4.9.0.80
